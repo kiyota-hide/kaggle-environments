@@ -378,6 +378,68 @@ def test_safe_art_is_not_disqualified():
     assert entry["yellow_art_disqualified"] is False
 
 
+# --- Spaced-out non-target labels caught by the any-word check --------------
+#
+# The consecutive-letter check ('TOP', 'HOUSE') and the target-word check
+# (letters-of-the-target with any/no separators) both catch obvious labels.
+# The gap is a non-target label spelled out with same-line separators --
+# 'A R O U N D', 'H-O-U-S-E', 'grid_view' -- which the consecutive check
+# doesn't fire on and the target-word check ignores (wrong word). These
+# tests lock in the same-line separator-aware any-word check. Any
+# non-letter, non-newline joiner is treated as a separator, so evasions
+# via '|', '/', ':', ',', '*', em-dash, non-breaking space etc. are all
+# rejected.
+
+
+def _art_check(art):
+    from kaggle_environments.envs.word_art.word_art import _art_contains_any_word
+    return _art_contains_any_word(art)
+
+
+@pytest.mark.parametrize("art", [
+    "A R O U N D",         # spaces
+    "A.R.O.U.N.D",         # dots
+    "H-O-U-S-E",           # dashes
+    "T\tO\tP",             # tabs
+    "grid_view",           # underscore compound
+    "T O P",               # 3-letter spaced
+    "H|O|U|S|E",           # pipes
+    "H/O/U/S/E",           # slashes
+    "H:O:U:S:E",           # colons
+    "H,O,U,S,E",           # commas
+    "H*O*U*S*E",           # asterisks
+    "H=O=U=S=E",           # equals
+    "H—O—U—S—E",  # em-dashes
+    "H–O–U–S–E",  # en-dashes
+    "H\xa0O\xa0U\xa0S\xa0E",         # non-breaking spaces
+    "A1B2C",               # digits used as separators
+])
+def test_spaced_non_target_label_is_disqualified(art):
+    assert _art_check(art) is True, f"expected {art!r} to be flagged as text"
+
+
+@pytest.mark.parametrize("art", [
+    "OOO",               # eye cluster
+    "III",               # columns
+    "V V V V",           # zigzag decoration
+    "T T T\nT T T",      # texture grid (single letter across a 2D layout)
+    "OO H2",             # short clusters + digit-adjacent
+    "O   O\n  V\n \\_/", # smiley (letters spread across lines)
+    "o o o\n o\no o o",  # die face
+    "\n   *\n \\ | /\n---+---\n / | \\\n   *\n",  # snowflake example
+])
+def test_visual_letter_elements_pass(art):
+    assert _art_check(art) is False, f"expected {art!r} to pass the any-word check"
+
+
+def test_letters_on_different_lines_do_not_chain():
+    """Same-line-only chaining: `T`, `O`, `P` each on their own line should
+    NOT combine into 'TOP' -- otherwise a 2D layout with letter-based
+    visual elements becomes unusable."""
+    art = "T\n O\n  P"
+    assert _art_check(art) is False
+
+
 def test_guesser_sees_placeholder_on_disqualification():
     """When the artist's art is disqualified, the guesser's teammate_art is
     replaced with the placeholder string and the original is NOT leaked."""
@@ -407,18 +469,15 @@ def test_disqualification_does_not_block_guessing():
     """Even with a disqualified art panel, the guesser still gets their full
     attempt budget and can still score if they correctly guess the word."""
 
-    def smart_guesser(observation, configuration):
+    def wrong_guesser(observation, configuration):
         if observation.role == "artist":
             return observation.target_word  # will be disqualified
-        # Guesser ignores the placeholder, makes a smart guess using history.
-        # On round 1, we cheat by reading target via a side channel: pull from
-        # the global state via the env's hidden _words on agent 0. Not possible
-        # via observation alone, so just guess randomly here -- the test only
-        # checks the structure (3 attempts allowed).
+        # Guesser ignores the placeholder and just guesses wrong every attempt
+        # -- the test only checks structure (3 attempts allowed, no points).
         return f"WRONG{len(observation.previous_guesses)}"
 
     env = make("word_art", configuration={"num_rounds": 1, "seed": 7})
-    env.run([smart_guesser] * 4)
+    env.run([wrong_guesser] * 4)
     j = env.toJSON()
     entry = j["steps"][-1][0]["observation"]["history"][0]
     # Both teams cheated → both disqualified, guessers still got their 3
@@ -467,6 +526,51 @@ def test_config_defaults_surfaced_on_observation():
     for s in env.state:
         assert s.observation.first_try_bonus == 1
         assert s.observation.max_art_chars == 4000
+
+
+def test_no_hidden_keys_leak_into_any_observation():
+    """Round-scoped hidden state (word list, in-progress art, guesses, per-team
+    done flags) must live on ``env``, not on any player's observation. A leak
+    onto ``state[i].observation`` (typically under an underscore-prefixed key)
+    would ship the target words and the opposing team's in-progress state
+    into the replay JSON and into whatever the agent process receives -- a
+    custom agent could then short-circuit the art channel entirely, and any
+    future prompt change that dumps the raw obs would silently leak.
+
+    We run a couple of rounds so both the art-phase and guess-phase code
+    paths get a chance to set fields on the observation.
+    """
+    env = _make(num_rounds=2, seed=1)
+    env.run(["random"] * 4)
+    forbidden_prefixes = ("_words", "_round_")
+    forbidden_keys = {"words", "target_words"}  # unprefixed variants
+    for step in env.steps:
+        for i, agent in enumerate(step):
+            obs = agent.observation
+            hidden = [
+                k for k in obs.keys()
+                if k in forbidden_keys or any(k.startswith(p) for p in forbidden_prefixes)
+            ]
+            assert not hidden, (
+                f"agent {i}'s observation leaks hidden keys {hidden}; "
+                "round-scoped state must live on env.word_art_state"
+            )
+
+
+def test_mid_game_missing_word_art_state_raises_clearly():
+    """env.word_art_state is not preserved across env.clone() or JSON
+    round-trips (Environment.clone constructs a fresh instance from
+    ``steps`` and doesn't carry over user attributes). Simulate the
+    lost-state case by deleting the attribute mid-game and confirm the
+    interpreter raises a clear RuntimeError instead of AttributeError-ing
+    deep inside process_step.
+    """
+    env = _make(num_rounds=2, seed=1)
+    env.step([None] * 4)  # advance out of the phase="" init branch
+    assert env.state[0].observation.phase != ""
+    del env.word_art_state
+    with pytest.raises(RuntimeError, match="word_art_state is missing"):
+        env.step([None] * 4)
 
 
 # --- Failure-status preservation across phase / round transitions ----------
